@@ -17,7 +17,7 @@ import os
 
 import psycopg
 import voyageai
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 MODEL = "voyage-3.5"
 
