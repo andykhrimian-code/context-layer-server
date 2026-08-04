@@ -21,11 +21,7 @@ from fastmcp import FastMCP
 
 MODEL = "voyage-3.5"
 
-mcp = FastMCP(
-    "context-layer",
-    host="0.0.0.0",
-    port=int(os.environ.get("PORT", 8000)),
-)
+mcp = FastMCP("context-layer")
 
 
 @mcp.tool()
