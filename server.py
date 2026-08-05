@@ -4,22 +4,30 @@ Context Layer — MCP server for the AI Grad knowledge base.
 
 DESIGN NOTE — read before changing anything.
 
-The database does the pipeline, not this server. Triggers in Postgres handle:
-  candidates_route            sets gate_result, gate_reason, review_by, status
+The DATABASE owns the pipeline, not this server. Postgres triggers handle:
+  candidates_route            gate_result, gate_reason, review_by, status
   candidates_publish          creates the entries row on auto_publish/approve
   candidates_require_reviewer blocks approval without reviewer + owner
   entries_maintain            builds search_vector, bumps updated_at
   sources_flag_duplicate      fills possible_duplicate_of from span_hash
 
-So this server MUST NOT compute the gate, decide status, or insert into
-entries. Doing any of that duplicates the triggers and creates double rows.
-Insert the row, let the database decide.
+And retrieval ranking lives in the DB function search_kb_hybrid(), which
+ORs across the text and vector legs so a lexical miss can still be rescued
+by semantic similarity, and reports which leg matched.
 
-The one thing triggers cannot do is call an embedding API, so every
+So this server MUST NOT compute the gate, decide status, insert into
+entries, or reimplement ranking. Insert the row, call the function, let the
+database decide. Duplicating any of it guarantees drift.
+
+The one thing Postgres cannot do is call an embedding API, so every
 trigger-created entry starts with embedding NULL. backfill_embeddings()
-fixes that and is called automatically after any write that may publish.
+fixes that and runs automatically after any write that may publish.
 
-Env: DATABASE_URL, VOYAGE_API_KEY, PORT
+Embeddings: OpenAI text-embedding-3-small at dimensions=1024, which matches
+entries.embedding vector(1024) exactly. Chosen over Voyage because OpenAI's
+API does not train on business data by default.
+
+Env: DATABASE_URL, OPENAI_API_KEY, PORT
 """
 
 import hashlib
@@ -28,10 +36,11 @@ import os
 import uuid
 
 import psycopg
-import voyageai
 from fastmcp import FastMCP
+from openai import OpenAI
 
-MODEL = "voyage-3.5"  # 1024 dims — matches entries.embedding
+EMBED_MODEL = "text-embedding-3-small"
+EMBED_DIMS = 1024  # must match entries.embedding vector(1024)
 
 mcp = FastMCP("context-layer")
 
@@ -40,12 +49,17 @@ def _db():
     return psycopg.connect(os.environ["DATABASE_URL"])
 
 
-def _embed(texts, input_type):
-    return voyageai.Client().embed(texts, model=MODEL, input_type=input_type).embeddings
+def _embed(texts: list[str]) -> list[list[float]]:
+    """OpenAI has no document/query distinction — one call shape for both."""
+    resp = OpenAI().embeddings.create(
+        model=EMBED_MODEL, input=texts, dimensions=EMBED_DIMS
+    )
+    # Sort by index rather than trusting response order.
+    return [d.embedding for d in sorted(resp.data, key=lambda d: d.index)]
 
 
 def _backfill(conn) -> int:
-    """Embed any published entry that doesn't have a vector yet."""
+    """Embed any published entry that has no vector yet."""
     with conn.cursor() as cur:
         cur.execute(
             "select id, title, body, aliases from entries where embedding is null"
@@ -55,7 +69,7 @@ def _backfill(conn) -> int:
         return 0
 
     texts = [f"{t}\n{b}\n{' '.join(a or [])}" for _, t, b, a in rows]
-    vectors = _embed(texts, "document")
+    vectors = _embed(texts)
 
     with conn.cursor() as cur:
         for (eid, *_), vec in zip(rows, vectors):
@@ -70,7 +84,7 @@ def _backfill(conn) -> int:
 # ------------------------------------------------------------------ read
 
 @mcp.tool()
-def search_knowledge(query: str, limit: int = 4) -> str:
+def search_knowledge(query: str, limit: int = 5) -> str:
     """
     Search the AI Grad knowledge base for internal Housecall Pro knowledge.
 
@@ -84,33 +98,34 @@ def search_knowledge(query: str, limit: int = 4) -> str:
     Housecall-Pro-specific. If it's unclear whether a question is internal,
     search here first — a miss costs nothing.
     """
-    vec = str(_embed([query], "query")[0])
-    sql = """
-        select title, body, section, status, review_by,
-               0.7 * coalesce(1 - (embedding <=> %s::vector), 0)
-             + 0.3 * coalesce(ts_rank(search_vector,
-                       plainto_tsquery('english', %s)), 0) as score
-        from entries
-        where status in ('live', 'live_unreviewed')
-        order by score desc
-        limit %s
-    """
+    vec = str(_embed([query])[0])
+
     with _db() as conn, conn.cursor() as cur:
-        cur.execute(sql, (vec, query, limit))
+        # Ranking lives in the DB. Do not reimplement it here.
+        cur.execute(
+            """select title, body, section, standing, owner, captured_by,
+                      is_stale, text_rank, vector_score, matched_by
+               from search_kb_hybrid(%s, %s::vector, %s)""",
+            (query, vec, limit),
+        )
         rows = cur.fetchall()
 
     if not rows:
         return "No entries found in the knowledge base."
 
-    from datetime import date
     out = []
-    for title, body, section, status, review_by, score in rows:
+    for (title, body, section, standing, owner, captured_by,
+         is_stale, t_rank, v_score, matched_by) in rows:
         flags = ""
-        if review_by and review_by < date.today():
+        if is_stale:
             flags += " [STALE — past review date]"
-        if status == "live_unreviewed":
+        if standing and standing.startswith("LIVE_UNREVIEWED"):
             flags += " [auto-published, not human-reviewed]"
-        out.append(f"## {title}{flags}\n{body}\n(section: {section} · score {score:.2f})")
+        out.append(
+            f"## {title}{flags}\n{body}\n"
+            f"(section: {section} · owner: {owner} · captured by {captured_by} · "
+            f"matched by {matched_by}: text {t_rank:.2f} / vector {v_score:.2f})"
+        )
     return "\n\n".join(out)
 
 
@@ -207,14 +222,13 @@ def list_pending_sources(limit: int = 5) -> str:
 def submit_candidates(source_id: str, candidates: list[dict]) -> str:
     """
     Submit distilled candidates from a processed source. The DATABASE decides
-    what publishes — this tool only inserts and reports back what the gate did.
+    what publishes — this tool only inserts and reports what the gate did.
 
     Each candidate REQUIRES:
       title            the claim itself, as a statement
       body             1-3 sentences; preserve any hedges from the source
       evidence         [{"quote": "...", "turn_ref": "s-2"}] — at least one,
-                       quoted from the source. A candidate with no evidence
-                       fails the gate automatically.
+                       quoted from the source. No evidence fails the gate.
       section          tools_and_access | processes_and_workflows | who_to_ask
                        | facts_and_best_practices | company_context | unclassified
       origin_type      human_stated | model_suggested | joint_synthesis
@@ -226,13 +240,13 @@ def submit_candidates(source_id: str, candidates: list[dict]) -> str:
       score_reasons    {"relevance": "...", "specificity": "...",
                         "groundedness": "..."}
 
-    Optional: aliases (alternate phrasings people would search — include
-    name-based ones like "what did Sani say about X"), classification
-    (new | update | conflict | duplicate), sensitive, owner.
+    Optional: aliases (alternate phrasings people would search),
+    classification (new | update | conflict | duplicate), sensitive, owner.
 
-    Write entries SELF-CONTAINED: each is retrieved alone, so never write
-    "he said" or "as mentioned above". Keep attribution in the text itself —
-    retrieval cannot recover who said something otherwise.
+    Write entries SELF-CONTAINED — each is retrieved alone, so never write
+    "he said" or "as mentioned above". Name the speaker IN THE BODY TEXT where
+    attribution matters; `owner` is who maintains the entry, not who said it,
+    and is not a substitute for attribution in the prose.
     """
     if not candidates:
         return "No candidates provided."
@@ -347,8 +361,7 @@ def review_candidate(
 
     reviewer is REQUIRED — the database refuses anonymous approvals. owner
     defaults to the reviewer if not given. Optionally correct the text with
-    edited_title / edited_body before publishing; the original model draft is
-    preserved in agent_draft regardless.
+    edited_title / edited_body; the original draft is kept in agent_draft.
     """
     if decision not in ("approve", "reject"):
         return "ERROR: decision must be 'approve' or 'reject'."
@@ -377,24 +390,22 @@ def review_candidate(
                 conn.commit()
                 return f"Rejected '{title}'. Logged permanently; it will not publish."
 
-            sets, params = ["status='approved'", "reviewer=%s", "owner=%s"], \
-                           [reviewer, owner.strip() or reviewer]
+            sets = ["status='approved'", "reviewer=%s", "owner=%s"]
+            params = [reviewer, owner.strip() or reviewer]
             if edited_title:
                 sets.append("title=%s"); params.append(edited_title)
             if edited_body:
                 sets.append("body=%s"); params.append(edited_body)
             params.append(candidate_id)
 
-            # The candidates_publish trigger creates the entry on this update.
-            cur.execute(
-                f"update candidates set {', '.join(sets)} where id=%s", params
-            )
+            # candidates_publish trigger creates the entry on this update.
+            cur.execute(f"update candidates set {', '.join(sets)} where id=%s", params)
         conn.commit()
         embedded = _backfill(conn)
 
     return (f"Approved '{edited_title or title}' — published as human-reviewed "
-            f"and now searchable. Embedded {embedded} entr"
-            f"{'y' if embedded == 1 else 'ies'}.")
+            f"and now searchable. Embedded {embedded} "
+            f"entr{'y' if embedded == 1 else 'ies'}.")
 
 
 @mcp.tool()
@@ -402,8 +413,8 @@ def backfill_embeddings() -> str:
     """
     Embed any published entry missing a vector. Safe to run any time.
 
-    Needed because entries created by the database trigger (including ones
-    approved directly via SQL) have no embedding until this runs — they are
+    Needed because entries created by the database trigger — including ones
+    approved directly via SQL — have no embedding until this runs. They are
     findable by keyword but not by meaning.
     """
     with _db() as conn:
