@@ -2,38 +2,36 @@
 """
 Context Layer — MCP server for the AI Grad knowledge base.
 
-Targets the `ai-grad-knowledge-base` Supabase project (Ice's schema).
+DESIGN NOTE — read before changing anything.
 
-Read:    search_knowledge      — hybrid vector + full-text over published entries
-Write:   submit_learning       — raw conversation span -> sources (pending)
-         list_pending_sources  — what's waiting to be processed
-         submit_candidates     — scored candidates -> gate -> auto-publish or review
-Review:  list_review_queue     — what didn't auto-publish, and why
-         review_candidate      — approve / reject a queued candidate
+The database does the pipeline, not this server. Triggers in Postgres handle:
+  candidates_route            sets gate_result, gate_reason, review_by, status
+  candidates_publish          creates the entries row on auto_publish/approve
+  candidates_require_reviewer blocks approval without reviewer + owner
+  entries_maintain            builds search_vector, bumps updated_at
+  sources_flag_duplicate      fills possible_duplicate_of from span_hash
 
-Gate logic mirrors the database:
-  * is_carve_out() -> always human review (update/conflict, sensitive,
-    official_policy, or unclassified section)
-  * core + high + grounded -> auto-publish
-  * everything else -> review queue
+So this server MUST NOT compute the gate, decide status, or insert into
+entries. Doing any of that duplicates the triggers and creates double rows.
+Insert the row, let the database decide.
 
-Env vars: DATABASE_URL, VOYAGE_API_KEY, PORT
+The one thing triggers cannot do is call an embedding API, so every
+trigger-created entry starts with embedding NULL. backfill_embeddings()
+fixes that and is called automatically after any write that may publish.
+
+Env: DATABASE_URL, VOYAGE_API_KEY, PORT
 """
 
 import hashlib
 import json
 import os
 import uuid
-from datetime import date, timedelta
 
 import psycopg
 import voyageai
 from fastmcp import FastMCP
 
-MODEL = "voyage-3.5"          # 1024 dims, matches entries.embedding
-DEFAULT_REVIEW_DAYS = 90
-VOLATILE_SECTIONS = {"tools_and_access", "processes_and_workflows"}
-VOLATILE_REVIEW_DAYS = 45
+MODEL = "voyage-3.5"  # 1024 dims — matches entries.embedding
 
 mcp = FastMCP("context-layer")
 
@@ -46,12 +44,30 @@ def _embed(texts, input_type):
     return voyageai.Client().embed(texts, model=MODEL, input_type=input_type).embeddings
 
 
-def _review_by(section: str) -> date:
-    days = VOLATILE_REVIEW_DAYS if section in VOLATILE_SECTIONS else DEFAULT_REVIEW_DAYS
-    return date.today() + timedelta(days=days)
+def _backfill(conn) -> int:
+    """Embed any published entry that doesn't have a vector yet."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "select id, title, body, aliases from entries where embedding is null"
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return 0
+
+    texts = [f"{t}\n{b}\n{' '.join(a or [])}" for _, t, b, a in rows]
+    vectors = _embed(texts, "document")
+
+    with conn.cursor() as cur:
+        for (eid, *_), vec in zip(rows, vectors):
+            cur.execute(
+                "update entries set embedding = %s::vector where id = %s",
+                (str(vec), eid),
+            )
+    conn.commit()
+    return len(rows)
 
 
-# ---------------------------------------------------------------- read
+# ------------------------------------------------------------------ read
 
 @mcp.tool()
 def search_knowledge(query: str, limit: int = 4) -> str:
@@ -59,21 +75,18 @@ def search_knowledge(query: str, limit: int = 4) -> str:
     Search the AI Grad knowledge base for internal Housecall Pro knowledge.
 
     Use this for ANY question about how things actually work at Housecall Pro
-    that would not be reliably documented publicly: tool and environment
-    access, product quirks and known limitations, internal team or project
-    names, who owns or built what, data warehouse structure, onboarding
-    conventions, and lessons captured from past sessions.
+    that wouldn't be reliably documented publicly: tool and environment access,
+    product quirks and limitations, internal team or project names, who owns or
+    built what, data warehouse structure, onboarding conventions, and lessons
+    captured from past sessions.
 
     Prefer this over web search or general knowledge for anything
-    Housecall-Pro-specific. If it is unclear whether a question is internal,
+    Housecall-Pro-specific. If it's unclear whether a question is internal,
     search here first — a miss costs nothing.
     """
     vec = str(_embed([query], "query")[0])
-
-    # Hybrid: semantic similarity carries most of the weight, lexical rank
-    # catches exact names and terms that vectors handle poorly.
     sql = """
-        select title, body, section, aliases, status, review_by,
+        select title, body, section, status, review_by,
                0.7 * coalesce(1 - (embedding <=> %s::vector), 0)
              + 0.3 * coalesce(ts_rank(search_vector,
                        plainto_tsquery('english', %s)), 0) as score
@@ -89,19 +102,19 @@ def search_knowledge(query: str, limit: int = 4) -> str:
     if not rows:
         return "No entries found in the knowledge base."
 
+    from datetime import date
     out = []
-    for title, body, section, aliases, status, review_by, score in rows:
-        stale = " [STALE — past review date]" if review_by < date.today() else ""
-        unreviewed = " [auto-published, not human-reviewed]" if status == "live_unreviewed" else ""
-        out.append(
-            f"## {title}{stale}{unreviewed}\n"
-            f"{body}\n"
-            f"(section: {section} · relevance score {score:.2f})"
-        )
+    for title, body, section, status, review_by, score in rows:
+        flags = ""
+        if review_by and review_by < date.today():
+            flags += " [STALE — past review date]"
+        if status == "live_unreviewed":
+            flags += " [auto-published, not human-reviewed]"
+        out.append(f"## {title}{flags}\n{body}\n(section: {section} · score {score:.2f})")
     return "\n\n".join(out)
 
 
-# ---------------------------------------------------------------- write
+# ----------------------------------------------------------------- write
 
 @mcp.tool()
 def submit_learning(
@@ -114,42 +127,40 @@ def submit_learning(
     sensitive_hint: bool = False,
 ) -> str:
     """
-    Save raw source material to the knowledge base. ALWAYS raw and first —
-    nothing is structured or scored here, so nothing is lost if later steps fail.
+    Save raw source material. Always raw, always first — nothing is structured
+    or scored here, so nothing is lost if later steps fail.
 
-    Pass EITHER `text` (a pasted note, transcript, or single learning) OR
-    `turns` (a conversation span as a list of
-    {role, text, actor|model, turn_ref} objects, matching the existing
-    convention).
+    Pass EITHER `text` (a pasted note or single learning) OR `turns` (a
+    conversation span: a list of {role, text, actor|model, turn_ref} objects).
 
     kind: conversation_span | pasted_note | transcript | document
     captured_by: full name of the person capturing.
-    capture_phrase: what the person actually said to trigger capture.
+    capture_phrase: what the person actually said to trigger the capture.
     sensitive_hint: true if it may touch personnel, customer, or unreleased
-    material — flags it for review rather than withholding it.
+      material. Flag rather than withhold — flagged content routes to a human,
+      withheld content disappears with no record.
 
-    Returns the source_id.
+    Returns the source_id, needed for submit_candidates.
     """
     if turns is None:
         if not text.strip():
-            return "ERROR: provide either `text` or `turns`. Nothing was saved."
-        turns = [{"role": "user", "text": text, "actor": captured_by, "turn_ref": "u-1"}]
+            return "ERROR: provide either `text` or `turns`. Nothing saved."
+        turns = [{"role": "user", "text": text, "actor": captured_by,
+                  "turn_ref": "u-1"}]
 
     canonical = "\n".join(t.get("text", "") for t in turns)
     span_hash = hashlib.sha256(canonical.encode()).hexdigest()
 
     with _db() as conn, conn.cursor() as cur:
-        # span_hash makes re-capturing the same span detectable
         cur.execute("select id from sources where span_hash = %s", (span_hash,))
-        existing = cur.fetchone()
-        if existing:
-            return f"Already captured — this exact span exists as source {existing[0]}."
+        if (existing := cur.fetchone()):
+            return f"Already captured — identical span exists as source {existing[0]}."
 
         cur.execute(
             """insert into sources
                (capture_request_id, turns, surface, capture_phrase, span_hash,
-                captured_by, kind, sensitive_hint, ingest_status)
-               values (%s, %s::jsonb, %s, %s, %s, %s, %s, %s, 'pending')
+                captured_by, kind, sensitive_hint)
+               values (%s, %s::jsonb, %s, %s, %s, %s, %s::source_kind, %s)
                returning id""",
             (str(uuid.uuid4()), json.dumps(turns), surface, capture_phrase,
              span_hash, captured_by, kind, sensitive_hint),
@@ -157,13 +168,14 @@ def submit_learning(
         source_id = cur.fetchone()[0]
         conn.commit()
 
-    return f"Saved as source {source_id} (pending). Not yet searchable — awaiting processing."
+    return (f"Saved as source {source_id} (pending). Not searchable yet — "
+            f"run a processing pass to turn it into entries.")
 
 
 @mcp.tool()
 def list_pending_sources(limit: int = 5) -> str:
     """
-    List raw sources captured but not yet turned into entries.
+    List raw sources captured but not yet processed into candidates.
 
     Use this to run a processing pass: read each pending source, distill it
     into candidates, and submit them with submit_candidates.
@@ -178,7 +190,7 @@ def list_pending_sources(limit: int = 5) -> str:
         rows = cur.fetchall()
 
     if not rows:
-        return "No pending sources. Everything captured has been processed."
+        return "No pending sources — everything captured has been processed."
 
     out = []
     for sid, by, at, kind, sens, turns in rows:
@@ -194,142 +206,98 @@ def list_pending_sources(limit: int = 5) -> str:
 @mcp.tool()
 def submit_candidates(source_id: str, candidates: list[dict]) -> str:
     """
-    Submit distilled, scored candidates from a processed source. The server
-    applies the gate and routes each one; it does not second-guess the scores.
+    Submit distilled candidates from a processed source. The DATABASE decides
+    what publishes — this tool only inserts and reports back what the gate did.
 
-    Each candidate dict REQUIRES:
-      title           — the claim itself, phrased as a statement
-      body            — 1-3 sentences of detail; preserve any hedges in the source
-      section         — tools_and_access | processes_and_workflows | who_to_ask
-                        | facts_and_best_practices | company_context | unclassified
-      origin_type     — human_stated | model_suggested | joint_synthesis
-      epistemic_status— official_policy | team_convention | reported_practice
-                        | personal_learning | proposal | unresolved
-      relevance       — core | supporting | peripheral
-      specificity     — high | medium | low
-      groundedness    — grounded | partial | ungrounded
-      score_reasons   — {"relevance": "...", "specificity": "...", "groundedness": "..."}
+    Each candidate REQUIRES:
+      title            the claim itself, as a statement
+      body             1-3 sentences; preserve any hedges from the source
+      evidence         [{"quote": "...", "turn_ref": "s-2"}] — at least one,
+                       quoted from the source. A candidate with no evidence
+                       fails the gate automatically.
+      section          tools_and_access | processes_and_workflows | who_to_ask
+                       | facts_and_best_practices | company_context | unclassified
+      origin_type      human_stated | model_suggested | joint_synthesis
+      epistemic_status official_policy | team_convention | reported_practice
+                       | personal_learning | proposal | unresolved
+      relevance        core | supporting | peripheral
+      specificity      high | medium | low
+      groundedness     grounded | partial | ungrounded
+      score_reasons    {"relevance": "...", "specificity": "...",
+                        "groundedness": "..."}
 
-    Optional: aliases (alternate phrasings people would search),
-    evidence ([{quote, turn_ref}] direct from the source),
-    classification (new | update | conflict | duplicate), sensitive, owner.
+    Optional: aliases (alternate phrasings people would search — include
+    name-based ones like "what did Sani say about X"), classification
+    (new | update | conflict | duplicate), sensitive, owner.
 
-    Write entries SELF-CONTAINED — they are retrieved alone, so never say
-    "he said" or "as mentioned above". Keep attribution in the text where it
-    matters, since retrieval cannot recover it otherwise.
+    Write entries SELF-CONTAINED: each is retrieved alone, so never write
+    "he said" or "as mentioned above". Keep attribution in the text itself —
+    retrieval cannot recover who said something otherwise.
     """
     if not candidates:
         return "No candidates provided."
 
-    required = ["title", "body", "section", "origin_type", "epistemic_status",
-                "relevance", "specificity", "groundedness", "score_reasons"]
+    required = ["title", "body", "evidence", "section", "origin_type",
+                "epistemic_status", "relevance", "specificity",
+                "groundedness", "score_reasons"]
     for i, c in enumerate(candidates):
-        missing = [f for f in required if not c.get(f)]
-        if missing:
-            return f"ERROR: candidate {i+1} ('{c.get('title','untitled')}') missing {missing}. Nothing saved."
+        if missing := [f for f in required if not c.get(f)]:
+            return (f"ERROR: candidate {i+1} ('{c.get('title','untitled')}') "
+                    f"missing {missing}. Nothing saved.")
 
-    published, queued, rejected = [], [], []
-
-    with _db() as conn, conn.cursor() as cur:
-        for c in candidates:
-            section = c["section"]
-            sensitive = bool(c.get("sensitive", False))
-            classification = c.get("classification", "new")
-            owner = c.get("owner") or "unassigned"
-            review_by = _review_by(section)
-
-            # Floor: not worth reviewing at all
-            gate_result = not (c["groundedness"] == "ungrounded"
-                               or c["relevance"] == "peripheral")
-
-            cur.execute(
-                "select is_carve_out(%s::classification, %s, %s::epistemic_status, %s::kb_section)",
-                (classification, sensitive, c["epistemic_status"], section),
-            )
-            carve_out = cur.fetchone()[0]
-
-            top_tier = (c["relevance"] == "core"
-                        and c["specificity"] == "high"
-                        and c["groundedness"] == "grounded")
-
-            if not gate_result:
-                status, reason = "rejected", f"below floor: {c['relevance']}/{c['groundedness']}"
-            elif carve_out:
-                status, reason = "needs_review", "carve-out: requires human judgement"
-            elif top_tier:
-                status, reason = "auto_published", "passed"
-            else:
-                status, reason = "needs_review", (
-                    f"not top tier: {c['relevance']}/{c['specificity']}/{c['groundedness']}")
+    results = []
+    with _db() as conn:
+        with conn.cursor() as cur:
+            for c in candidates:
+                # status / gate_result / gate_reason / review_by are set by the
+                # candidates_route BEFORE-INSERT trigger. Do not send them.
+                cur.execute(
+                    """insert into candidates
+                       (source_id, title, body, aliases, evidence, section,
+                        classification, origin_type, epistemic_status,
+                        relevance, specificity, groundedness, score_reasons,
+                        sensitive, agent_draft, owner)
+                       values (%s,%s,%s,%s,%s::jsonb,%s::kb_section,
+                               %s::classification,%s::origin_type,
+                               %s::epistemic_status,%s::relevance_tier,
+                               %s::specificity_tier,%s::groundedness_tier,
+                               %s::jsonb,%s,%s::jsonb,%s)
+                       returning status, gate_reason""",
+                    (source_id, c["title"], c["body"], c.get("aliases", []),
+                     json.dumps(c["evidence"]), c["section"],
+                     c.get("classification", "new"), c["origin_type"],
+                     c["epistemic_status"], c["relevance"], c["specificity"],
+                     c["groundedness"], json.dumps(c["score_reasons"]),
+                     bool(c.get("sensitive", False)), json.dumps(c),
+                     c.get("owner")),
+                )
+                status, reason = cur.fetchone()
+                results.append((c["title"], status, reason))
 
             cur.execute(
-                """insert into candidates
-                   (source_id, title, body, aliases, evidence, section, classification,
-                    origin_type, epistemic_status, relevance, specificity, groundedness,
-                    score_reasons, sensitive, agent_draft, owner, status,
-                    gate_result, gate_reason, review_by)
-                   values (%s,%s,%s,%s,%s::jsonb,%s::kb_section,%s::classification,
-                           %s::origin_type,%s::epistemic_status,%s::relevance_tier,
-                           %s::specificity_tier,%s::groundedness_tier,%s::jsonb,%s,
-                           %s::jsonb,%s,%s::candidate_status,%s,%s,%s)
-                   returning id""",
-                (source_id, c["title"], c["body"], c.get("aliases", []),
-                 json.dumps(c.get("evidence", [])), section, classification,
-                 c["origin_type"], c["epistemic_status"], c["relevance"],
-                 c["specificity"], c["groundedness"], json.dumps(c["score_reasons"]),
-                 sensitive, json.dumps(c), owner, status, gate_result, reason, review_by),
+                "update sources set ingest_status='processed' where id=%s",
+                (source_id,),
             )
-            candidate_id = cur.fetchone()[0]
-
-            if status == "auto_published":
-                _publish(cur, source_id, candidate_id, c, owner, review_by,
-                         "auto_pass", "live_unreviewed", None)
-                published.append(c["title"])
-            elif status == "rejected":
-                rejected.append(f"{c['title']} — {reason}")
-            else:
-                queued.append(f"{c['title']} — {reason}")
-
-        cur.execute(
-            "update sources set ingest_status='processed' where id=%s", (source_id,))
         conn.commit()
+        embedded = _backfill(conn)
 
-    lines = [f"Processed source {source_id}."]
+    published = [t for t, s, _ in results if s == "auto_published"]
+    queued = [(t, r) for t, s, r in results if s == "needs_review"]
+    rejected = [(t, r) for t, s, r in results if s == "rejected"]
+
+    lines = [f"Submitted {len(results)} candidates from source {source_id}."]
     if published:
-        lines.append(f"\nAuto-published ({len(published)}) — now searchable:")
+        lines.append(f"\nAuto-published ({len(published)}):")
         lines += [f"  - {t}" for t in published]
     if queued:
-        lines.append(f"\nQueued for review ({len(queued)}):")
-        lines += [f"  - {t}" for t in queued]
+        lines.append(f"\nHeld for review ({len(queued)}):")
+        lines += [f"  - {t} — {r}" for t, r in queued]
     if rejected:
         lines.append(f"\nRejected ({len(rejected)}):")
-        lines += [f"  - {t}" for t in rejected]
+        lines += [f"  - {t} — {r}" for t, r in rejected]
+    if embedded:
+        lines.append(f"\nEmbedded {embedded} newly published entries.")
     return "\n".join(lines)
-
-
-def _publish(cur, source_id, candidate_id, c, owner, review_by,
-             method, status, approved_by):
-    """Insert a published entry, with embedding and search vector."""
-    text_for_embedding = f"{c['title']}\n{c['body']}\n{' '.join(c.get('aliases', []))}"
-    vec = str(_embed([text_for_embedding], "document")[0])
-
-    cur.execute(
-        """insert into entries
-           (source_id, candidate_id, title, body, aliases, evidence, section,
-            origin_type, epistemic_status, owner, publication_method, review_by,
-            status, sensitive, approved_by, approved_at, embedding, search_vector)
-           values (%s,%s,%s,%s,%s,%s::jsonb,%s::kb_section,%s::origin_type,
-                   %s::epistemic_status,%s,%s::publication_method,%s,
-                   %s::entry_status,%s,%s,
-                   case when %s is null then null else now() end,
-                   %s::vector,
-                   to_tsvector('english', %s))""",
-        (source_id, candidate_id, c["title"], c["body"], c.get("aliases", []),
-         json.dumps(c.get("evidence", [])), c["section"], c["origin_type"],
-         c["epistemic_status"], owner, method, review_by, status,
-         bool(c.get("sensitive", False)), approved_by, approved_by,
-         vec, text_for_embedding),
-    )
 
 
 # ---------------------------------------------------------------- review
@@ -337,13 +305,14 @@ def _publish(cur, source_id, candidate_id, c, owner, review_by,
 @mcp.tool()
 def list_review_queue(limit: int = 10) -> str:
     """
-    Show candidates that did NOT auto-publish and are waiting for a human,
-    with the reason each was held. Ordered lowest-specificity first.
+    Show candidates awaiting a human decision, with why each was held.
+    Ordered lowest-specificity first.
     """
     with _db() as conn, conn.cursor() as cur:
         cur.execute(
-            """select id, title, body, section, relevance, specificity, groundedness,
-                      gate_reason, held_as_carve_out, captured_by, captured_at
+            """select id, title, body, section, relevance, specificity,
+                      groundedness, gate_reason, held_as_carve_out,
+                      captured_by, captured_at
                from review_queue limit %s""",
             (limit,),
         )
@@ -353,14 +322,11 @@ def list_review_queue(limit: int = 10) -> str:
         return "Review queue is empty."
 
     out = []
-    for (cid, title, body, section, rel, spec, grnd, reason,
-         carve, by, at) in rows:
-        tag = " [CARVE-OUT]" if carve else ""
-        out.append(
-            f"### {title}{tag}\n{body}\n"
-            f"id: {cid}\nsection: {section} · {rel}/{spec}/{grnd}\n"
-            f"held because: {reason}\ncaptured by {by} on {at:%Y-%m-%d}"
-        )
+    for cid, title, body, sec, rel, spec, grnd, reason, carve, by, at in rows:
+        tag = " [CARVE-OUT — needs human judgement]" if carve else ""
+        out.append(f"### {title}{tag}\n{body}\nid: {cid}\n"
+                   f"{sec} · {rel}/{spec}/{grnd} · held: {reason}\n"
+                   f"captured by {by} on {at:%Y-%m-%d}")
     return f"{len(rows)} awaiting review.\n\n" + "\n\n".join(out)
 
 
@@ -369,6 +335,7 @@ def review_candidate(
     candidate_id: str,
     decision: str,
     reviewer: str,
+    owner: str = "",
     edited_title: str = "",
     edited_body: str = "",
 ) -> str:
@@ -376,58 +343,72 @@ def review_candidate(
     Approve or reject a queued candidate.
 
     decision: 'approve' publishes it as human-reviewed and fully live;
-              'reject' records it permanently and it never publishes.
+              'reject' records it permanently so it never publishes.
 
-    Optionally pass edited_title / edited_body to correct it before publishing.
-    The original model draft is preserved in agent_draft either way.
+    reviewer is REQUIRED — the database refuses anonymous approvals. owner
+    defaults to the reviewer if not given. Optionally correct the text with
+    edited_title / edited_body before publishing; the original model draft is
+    preserved in agent_draft regardless.
     """
     if decision not in ("approve", "reject"):
         return "ERROR: decision must be 'approve' or 'reject'."
+    if not reviewer.strip():
+        return "ERROR: reviewer is required — the database rejects anonymous approvals."
 
-    with _db() as conn, conn.cursor() as cur:
-        cur.execute(
-            """select source_id, title, body, aliases, evidence, section,
-                      origin_type, epistemic_status, sensitive, owner, review_by
-               from candidates where id = %s and status = 'needs_review'""",
-            (candidate_id,),
-        )
-        row = cur.fetchone()
-        if not row:
-            return f"No candidate {candidate_id} awaiting review."
-
-        (source_id, title, body, aliases, evidence, section,
-         origin_type, epistemic_status, sensitive, owner, review_by) = row
-
-        if decision == "reject":
+    with _db() as conn:
+        with conn.cursor() as cur:
             cur.execute(
-                """update candidates
-                   set status='rejected', gate_result=false, reviewer=%s,
-                       gate_reason='rejected by reviewer'
-                   where id=%s""",
-                (reviewer, candidate_id),
+                "select title from candidates where id=%s and status='needs_review'",
+                (candidate_id,),
             )
-            conn.commit()
-            return f"Rejected '{title}'. Recorded permanently; it will not publish."
+            row = cur.fetchone()
+            if not row:
+                return f"No candidate {candidate_id} awaiting review."
+            title = row[0]
 
-        c = {
-            "title": edited_title or title,
-            "body": edited_body or body,
-            "aliases": aliases,
-            "evidence": evidence,
-            "section": section,
-            "origin_type": origin_type,
-            "epistemic_status": epistemic_status,
-            "sensitive": sensitive,
-        }
-        _publish(cur, source_id, candidate_id, c, owner or "unassigned",
-                 review_by, "human_review", "live", reviewer)
-        cur.execute(
-            "update candidates set status='approved', reviewer=%s where id=%s",
-            (reviewer, candidate_id),
-        )
+            if decision == "reject":
+                cur.execute(
+                    """update candidates
+                       set status='rejected', reviewer=%s, gate_result=false,
+                           gate_reason='rejected by reviewer'
+                       where id=%s""",
+                    (reviewer, candidate_id),
+                )
+                conn.commit()
+                return f"Rejected '{title}'. Logged permanently; it will not publish."
+
+            sets, params = ["status='approved'", "reviewer=%s", "owner=%s"], \
+                           [reviewer, owner.strip() or reviewer]
+            if edited_title:
+                sets.append("title=%s"); params.append(edited_title)
+            if edited_body:
+                sets.append("body=%s"); params.append(edited_body)
+            params.append(candidate_id)
+
+            # The candidates_publish trigger creates the entry on this update.
+            cur.execute(
+                f"update candidates set {', '.join(sets)} where id=%s", params
+            )
         conn.commit()
+        embedded = _backfill(conn)
 
-    return f"Approved and published '{c['title']}' as human-reviewed. Now searchable."
+    return (f"Approved '{edited_title or title}' — published as human-reviewed "
+            f"and now searchable. Embedded {embedded} entr"
+            f"{'y' if embedded == 1 else 'ies'}.")
+
+
+@mcp.tool()
+def backfill_embeddings() -> str:
+    """
+    Embed any published entry missing a vector. Safe to run any time.
+
+    Needed because entries created by the database trigger (including ones
+    approved directly via SQL) have no embedding until this runs — they are
+    findable by keyword but not by meaning.
+    """
+    with _db() as conn:
+        n = _backfill(conn)
+    return f"Embedded {n} entries." if n else "Nothing to backfill."
 
 
 if __name__ == "__main__":
