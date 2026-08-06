@@ -76,7 +76,9 @@ groundedness — grounded when every claim in the body traces to a quote; partia
 
 score_reasons — One sentence per axis on why the tier fits, as in the worked example.
 
-sensitive — true for customer data, personnel matters, unreleased plans, anything not broadly readable. true holds the entry for human review; it is kept, not discarded.
+sensitive — true only for: data about a specific named customer or their account; a matter concerning an individual's employment, performance, or compensation; or a product or business plan that has not been announced.
+
+Internal is not the same as sensitive. Everything in this knowledge base is internal — that is what it is for. A product limitation, an internal tool, a team's remit, a person's role and area of ownership, or how the company segments its market are all ordinary internal knowledge and are not sensitive. When a fact is merely non-public, that is not sufficient; ask whether disclosing it would harm a specific person, a specific customer, or an unannounced plan.
 
 Credentials are the exception to that, and they are never flagged — they are never extracted. Passwords, API keys, tokens, connection strings and private keys must not appear in any field, including quotes. When a learning is about a credential, keep the lesson and drop the secret: "the Supabase connection string lives in Render's environment variables, not in code" is the entry; the string itself never is. When the learning cannot survive the removal, return no candidate for it.
 
