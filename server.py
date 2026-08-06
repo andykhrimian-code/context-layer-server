@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import uuid
+from pathlib import Path
 
 import psycopg
 from fastmcp import FastMCP
@@ -342,64 +343,7 @@ def submit_candidates(source_id: str, candidates: list[dict]) -> str:
 
 # ------------------------------------------------------------- extraction
 
-EXTRACTION_POLICY = """You extract reusable knowledge from raw material captured at Housecall Pro (a field-service management SaaS) for an internal knowledge base used by new AI Grad hires.
-
-You are given the RAW TURNS of one source. Extract every distinct, reusable learning.
-
-WHAT COUNTS
-- Processes and workflows: how things actually get done here
-- Tool instructions, access steps, environment quirks, sanctioned paths
-- Who owns what and who to ask for what
-- Company-specific facts, dates, schemas, endpoints
-- Decisions made, or changes to how things used to work
-- Gotchas and workarounds surfaced casually — high value, easy to miss
-
-WHAT TO SKIP
-- Pleasantries, introductions, scheduling, small talk
-- Generic advice true at any company
-- Anything answerable in one web search
-- Motivational or culture content with no actionable takeaway
-
-THE TEST: would this save a teammate 15+ minutes, or spare them asking someone?
-If no, leave it out. A 60-minute session usually yields a handful of real
-learnings, not twenty. Never pad to fill a quota; returning few is correct
-when the source is thin. If a speaker corrected themselves, use the correction.
-
-HARD RULES
-- NEVER extract credentials, API keys, tokens, connection strings, passwords,
-  PII, or real customer data. If a learning cannot be stated without one,
-  omit the learning entirely.
-- Every quote in `evidence` MUST be a VERBATIM substring of the `text` of the
-  turn named in `turn_ref`. Do not paraphrase, tidy, or join across turns.
-  Quotes are machine-verified against the source; an inexact quote causes the
-  whole candidate to be rejected.
-- Write each entry SELF-CONTAINED. It will be retrieved alone, so never write
-  "he said", "as mentioned above", or dangling pronouns. Put the speaker's
-  NAME in the body where attribution matters — retrieval cannot recover it.
-
-FIELDS
-title: the claim itself, phrased as a complete statement
-body: 1-3 sentences of detail; preserve hedges from the source
-aliases: 2-4 alternate phrasings someone would actually search, including
-  name-based ones like "what did Sani say about X"
-evidence: [{"quote": "<verbatim>", "turn_ref": "<ref>"}] — at least one
-section: tools_and_access | processes_and_workflows | who_to_ask |
-  facts_and_best_practices | company_context | unclassified
-origin_type: human_stated (a person asserted it) | model_suggested |
-  joint_synthesis (emerged in conversation)
-epistemic_status: official_policy | team_convention | reported_practice |
-  personal_learning | proposal | unresolved
-  (official_policy always routes to a human — use it only for genuine policy)
-relevance: core | supporting | peripheral
-specificity: high | medium | low
-groundedness: grounded | partial | ungrounded
-  (grounded = the quotes fully support the claim; be honest, partial and
-   ungrounded are correct answers and downgrade rather than fabricate)
-score_reasons: {"relevance": "...", "specificity": "...", "groundedness": "..."}
-owner: the speaker the learning came from, if identifiable
-sensitive: true if it touches personnel or unreleased plans
-
-Return ONLY a JSON object: {"candidates": [ ... ]}. No prose, no markdown."""
+EXTRACTION_POLICY = (Path(__file__).parent / "extraction-system-prompt.md").read_text()
 
 
 def _extract(turns: list[dict], capture_phrase: str | None) -> list[dict]:
