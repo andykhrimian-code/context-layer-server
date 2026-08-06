@@ -23,11 +23,16 @@ The one thing Postgres cannot do is call an embedding API, so every
 trigger-created entry starts with embedding NULL. backfill_embeddings()
 fixes that and runs automatically after any write that may publish.
 
+Capture goes through the capture_source() RPC, not a raw INSERT — that is
+where idempotency (capture_request_id) and span-hash duplicate detection
+live. Extraction is a separate, asynchronous pass so that capture itself
+stays instant.
+
 Embeddings: OpenAI text-embedding-3-small at dimensions=1024, which matches
 entries.embedding vector(1024) exactly. Chosen over Voyage because OpenAI's
 API does not train on business data by default.
 
-Env: DATABASE_URL, OPENAI_API_KEY, PORT
+Env: DATABASE_URL, OPENAI_API_KEY, PORT, EXTRACTION_MODEL (optional)
 """
 
 import hashlib
@@ -40,6 +45,8 @@ from fastmcp import FastMCP
 from openai import OpenAI
 
 EMBED_MODEL = "text-embedding-3-small"
+# Set EXTRACTION_MODEL to whatever the OpenAI account actually has access to.
+EXTRACT_MODEL = os.environ.get("EXTRACTION_MODEL", "gpt-5.5")
 EMBED_DIMS = 1024  # must match entries.embedding vector(1024)
 
 mcp = FastMCP("context-layer")
@@ -140,51 +147,70 @@ def submit_learning(
     surface: str = "claude_chat",
     capture_phrase: str = "",
     sensitive_hint: bool = False,
+    capture_request_id: str = "",
 ) -> str:
     """
     Save raw source material. Always raw, always first — nothing is structured
     or scored here, so nothing is lost if later steps fail.
 
-    Pass EITHER `text` (a pasted note or single learning) OR `turns` (a
-    conversation span: a list of {role, text, actor|model, turn_ref} objects).
+    Pass EITHER `text` (a pasted note or single learning) OR `turns` — the
+    EXACT conversation turns, as a list of
+    {turn_ref, role, actor|model, text}. Send real turns, never a paraphrase:
+    extraction quotes the source text and the database verifies those quotes
+    against these turns. A paraphrase makes verification pass while proving
+    nothing.
 
     kind: conversation_span | pasted_note | transcript | document
-    captured_by: full name of the person capturing.
-    capture_phrase: what the person actually said to trigger the capture.
-    sensitive_hint: true if it may touch personnel, customer, or unreleased
-      material. Flag rather than withhold — flagged content routes to a human,
-      withheld content disappears with no record.
+    capture_phrase: your one-line framing of what the person wanted kept.
+      Extraction reads this as a pointer to the part that matters.
+    sensitive_hint: true if it may touch personnel or unreleased material.
+      NEVER send credentials, keys, or connection strings at all — refuse
+      instead; the flag is for review routing, not redaction.
+    capture_request_id: pass the SAME uuid when retrying a failed call.
+      Leave blank on a first attempt and one is minted.
 
-    Returns the source_id, needed for submit_candidates.
+    Returns source_id plus whether it was already captured or looks like a
+    duplicate of existing material.
     """
     if turns is None:
         if not text.strip():
             return "ERROR: provide either `text` or `turns`. Nothing saved."
-        turns = [{"role": "user", "text": text, "actor": captured_by,
-                  "turn_ref": "u-1"}]
+        turns = [{"turn_ref": "u-1", "role": "user", "actor": captured_by,
+                  "text": text}]
 
-    canonical = "\n".join(t.get("text", "") for t in turns)
-    span_hash = hashlib.sha256(canonical.encode()).hexdigest()
+    # Give every turn a turn_ref — evidence verification looks turns up by it.
+    for i, t in enumerate(turns, 1):
+        t.setdefault("turn_ref", f"t-{i}")
+
+    req_id = capture_request_id.strip() or str(uuid.uuid4())
 
     with _db() as conn, conn.cursor() as cur:
-        cur.execute("select id from sources where span_hash = %s", (span_hash,))
-        if (existing := cur.fetchone()):
-            return f"Already captured — identical span exists as source {existing[0]}."
-
+        # capture_source() owns idempotency and span hashing. Do not
+        # hand-roll an INSERT here — that bypasses both.
         cur.execute(
-            """insert into sources
-               (capture_request_id, turns, surface, capture_phrase, span_hash,
-                captured_by, kind, sensitive_hint)
-               values (%s, %s::jsonb, %s, %s, %s, %s, %s::source_kind, %s)
-               returning id""",
-            (str(uuid.uuid4()), json.dumps(turns), surface, capture_phrase,
-             span_hash, captured_by, kind, sensitive_hint),
+            """select source_id, turn_count, span_hash,
+                      already_captured, possible_duplicate, sensitive_hint
+               from capture_source(%s::uuid, %s::jsonb, %s, %s::source_kind,
+                                   %s, %s, %s)""",
+            (req_id, json.dumps(turns), captured_by, kind,
+             surface, capture_phrase or None, sensitive_hint),
         )
-        source_id = cur.fetchone()[0]
+        sid, n_turns, _hash, already, dup, sens = cur.fetchone()
         conn.commit()
 
-    return (f"Saved as source {source_id} (pending). Not searchable yet — "
-            f"run a processing pass to turn it into entries.")
+    if already:
+        return (f"Already captured — same capture_request_id was retried. "
+                f"Source {sid}, {n_turns} turns. This is success, not an error.")
+
+    notes = []
+    if dup:
+        notes.append("Looks like material already captured by someone else — "
+                     "that's signal, not a problem.")
+    if sens:
+        notes.append("Flagged sensitive; it will route to human review.")
+
+    return (f"Captured source {sid} ({n_turns} turns), pending extraction. "
+            f"Not searchable yet." + ("\n" + " ".join(notes) if notes else ""))
 
 
 @mcp.tool()
@@ -312,6 +338,223 @@ def submit_candidates(source_id: str, candidates: list[dict]) -> str:
     if embedded:
         lines.append(f"\nEmbedded {embedded} newly published entries.")
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------- extraction
+
+EXTRACTION_POLICY = """You extract reusable knowledge from raw material captured at Housecall Pro (a field-service management SaaS) for an internal knowledge base used by new AI Grad hires.
+
+You are given the RAW TURNS of one source. Extract every distinct, reusable learning.
+
+WHAT COUNTS
+- Processes and workflows: how things actually get done here
+- Tool instructions, access steps, environment quirks, sanctioned paths
+- Who owns what and who to ask for what
+- Company-specific facts, dates, schemas, endpoints
+- Decisions made, or changes to how things used to work
+- Gotchas and workarounds surfaced casually — high value, easy to miss
+
+WHAT TO SKIP
+- Pleasantries, introductions, scheduling, small talk
+- Generic advice true at any company
+- Anything answerable in one web search
+- Motivational or culture content with no actionable takeaway
+
+THE TEST: would this save a teammate 15+ minutes, or spare them asking someone?
+If no, leave it out. A 60-minute session usually yields a handful of real
+learnings, not twenty. Never pad to fill a quota; returning few is correct
+when the source is thin. If a speaker corrected themselves, use the correction.
+
+HARD RULES
+- NEVER extract credentials, API keys, tokens, connection strings, passwords,
+  PII, or real customer data. If a learning cannot be stated without one,
+  omit the learning entirely.
+- Every quote in `evidence` MUST be a VERBATIM substring of the `text` of the
+  turn named in `turn_ref`. Do not paraphrase, tidy, or join across turns.
+  Quotes are machine-verified against the source; an inexact quote causes the
+  whole candidate to be rejected.
+- Write each entry SELF-CONTAINED. It will be retrieved alone, so never write
+  "he said", "as mentioned above", or dangling pronouns. Put the speaker's
+  NAME in the body where attribution matters — retrieval cannot recover it.
+
+FIELDS
+title: the claim itself, phrased as a complete statement
+body: 1-3 sentences of detail; preserve hedges from the source
+aliases: 2-4 alternate phrasings someone would actually search, including
+  name-based ones like "what did Sani say about X"
+evidence: [{"quote": "<verbatim>", "turn_ref": "<ref>"}] — at least one
+section: tools_and_access | processes_and_workflows | who_to_ask |
+  facts_and_best_practices | company_context | unclassified
+origin_type: human_stated (a person asserted it) | model_suggested |
+  joint_synthesis (emerged in conversation)
+epistemic_status: official_policy | team_convention | reported_practice |
+  personal_learning | proposal | unresolved
+  (official_policy always routes to a human — use it only for genuine policy)
+relevance: core | supporting | peripheral
+specificity: high | medium | low
+groundedness: grounded | partial | ungrounded
+  (grounded = the quotes fully support the claim; be honest, partial and
+   ungrounded are correct answers and downgrade rather than fabricate)
+score_reasons: {"relevance": "...", "specificity": "...", "groundedness": "..."}
+owner: the speaker the learning came from, if identifiable
+sensitive: true if it touches personnel or unreleased plans
+
+Return ONLY a JSON object: {"candidates": [ ... ]}. No prose, no markdown."""
+
+
+def _extract(turns: list[dict], capture_phrase: str | None) -> list[dict]:
+    """Ask the model to turn raw turns into scored candidates."""
+    rendered = "\n\n".join(
+        f"[{t.get('turn_ref','?')}] {t.get('actor') or t.get('model') or t.get('role','?')}: "
+        f"{t.get('text','')}"
+        for t in turns
+    )
+    framing = (f"\n\nThe person capturing this framed it as: {capture_phrase}\n"
+               f"Weight that as a pointer to what matters."
+               if capture_phrase else "")
+
+    resp = OpenAI().chat.completions.create(
+        model=EXTRACT_MODEL,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": EXTRACTION_POLICY},
+            {"role": "user", "content": f"RAW TURNS:\n\n{rendered}{framing}"},
+        ],
+    )
+    return json.loads(resp.choices[0].message.content).get("candidates", [])
+
+
+@mcp.tool()
+def process_pending_sources(limit: int = 1, dry_run: bool = False) -> str:
+    """
+    Run the extraction pass: turn captured raw sources into scored candidates.
+
+    This is the step between capture and retrieval. Captured material sits at
+    ingest_status='pending' and is NOT searchable until this runs.
+
+    For each pending source it extracts candidates, then inserts them — at
+    which point the database verifies every quote against the raw turns,
+    checks for duplicates, applies the gate, and routes each candidate to
+    auto-publish or review. This tool does not make any of those decisions.
+
+    dry_run=True extracts and shows what would be submitted without writing,
+    which is the safe way to sanity-check the extraction policy.
+
+    Start with limit=1. Extraction quality is worth eyeballing before batching.
+    """
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """select id, turns, capture_phrase, captured_by, kind
+                   from sources
+                   where ingest_status = 'pending'
+                   order by captured_at
+                   limit %s""",
+                (limit,),
+            )
+            pending = cur.fetchall()
+
+        if not pending:
+            return "No pending sources — everything captured has been processed."
+
+        report = []
+        for sid, turns, phrase, by, kind in pending:
+            if dry_run:
+                try:
+                    drafted = _extract(turns, phrase)
+                except Exception as exc:
+                    report.append(f"### source {sid}\n  extraction failed: {exc}")
+                    continue
+                report.append(
+                    f"### source {sid} — DRY RUN, nothing written\n"
+                    + "\n".join(
+                        f"  - [{c.get('relevance')}/{c.get('specificity')}/"
+                        f"{c.get('groundedness')}] {c.get('title')}"
+                        for c in drafted
+                    )
+                )
+                continue
+
+            # Claim the source so a concurrent run doesn't double-process it.
+            with conn.cursor() as cur:
+                cur.execute(
+                    """update sources
+                       set ingest_status='processing',
+                           processing_started_at = now(),
+                           attempt_count = attempt_count + 1
+                       where id = %s and ingest_status = 'pending'
+                       returning attempt_count""",
+                    (sid,),
+                )
+                claimed = cur.fetchone()
+            conn.commit()
+            if not claimed:
+                continue
+
+            try:
+                drafted = _extract(turns, phrase)
+            except Exception as exc:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """update sources set ingest_status='failed',
+                                  last_error=%s where id=%s""",
+                        (str(exc)[:500], sid),
+                    )
+                conn.commit()
+                report.append(f"### source {sid}\n  FAILED during extraction: {exc}")
+                continue
+
+            outcomes = []
+            for c in drafted:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """insert into candidates
+                               (source_id, title, body, aliases, evidence, section,
+                                classification, origin_type, epistemic_status,
+                                relevance, specificity, groundedness, score_reasons,
+                                sensitive, agent_draft, owner)
+                               values (%s,%s,%s,%s,%s::jsonb,%s::kb_section,
+                                       'new'::classification,%s::origin_type,
+                                       %s::epistemic_status,%s::relevance_tier,
+                                       %s::specificity_tier,%s::groundedness_tier,
+                                       %s::jsonb,%s,%s::jsonb,%s)
+                               returning status, gate_reason""",
+                            (sid, c["title"], c["body"], c.get("aliases", []),
+                             json.dumps(c.get("evidence", [])), c.get("section",
+                             "unclassified"), c.get("origin_type", "human_stated"),
+                             c.get("epistemic_status", "reported_practice"),
+                             c.get("relevance", "supporting"),
+                             c.get("specificity", "medium"),
+                             c.get("groundedness", "partial"),
+                             json.dumps(c.get("score_reasons", {})),
+                             bool(c.get("sensitive", False)), json.dumps(c),
+                             c.get("owner")),
+                        )
+                        status, reason = cur.fetchone()
+                    conn.commit()
+                    outcomes.append((c["title"], status, reason))
+                except Exception as exc:
+                    conn.rollback()
+                    outcomes.append((c.get("title", "untitled"), "error", str(exc)[:160]))
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "update sources set ingest_status='processed', last_error=null "
+                    "where id=%s", (sid,),
+                )
+            conn.commit()
+
+            lines = [f"### source {sid} ({kind}, captured by {by}) — "
+                     f"{len(drafted)} extracted"]
+            for title, status, reason in outcomes:
+                lines.append(f"  [{status}] {title}\n      {reason}")
+            report.append("\n".join(lines))
+
+        embedded = 0 if dry_run else _backfill(conn)
+
+    tail = f"\n\nEmbedded {embedded} newly published entries." if embedded else ""
+    return "\n\n".join(report) + tail
 
 
 # ---------------------------------------------------------------- review
